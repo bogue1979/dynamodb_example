@@ -1,9 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -17,7 +19,7 @@ func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]Observat
 
 	params := &dynamodb.QueryInput{
 		TableName: aws.String(table), // Required
-		Limit:     aws.Int64(3),
+		Limit:     aws.Int64(1000),
 		IndexName: aws.String("datasetId-validAt-index"),
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
 			":v_ID": { // Required
@@ -56,46 +58,112 @@ func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]Observat
 	return ret, nil
 }
 
-// example: curl "localhost:8080/radar/observation/obs-radar.ukmo.uk.sh.s3.mg%2F1km%2Fintensity?timestampFrom=2016-09-08T11%3A58%3A13Z&timestampTo=2016-09-08T12%3A58%3A13Z"
+// auth wrapper based on check function
+func auth(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, pass, _ := r.BasicAuth()
+		if !check(user, pass) {
+			http.Error(w, "Unauthorized.", 401)
+			return
+		}
+		fn(w, r)
+	}
+}
 
-func observations(w http.ResponseWriter, r *http.Request) {
+func check(user, pass string) bool {
+	//fmt.Println("in check fn: ", user, " ", pass)
+	users := map[string]string{
+		"user":  "pass",
+		"user2": "pass2",
+	}
+	if user == "" || pass == "" {
+		return false
+	}
+	if users[user] == pass {
+		return true
+	}
+	return false
+}
+
+// example: curl  -u user:pass "localhost:8080/radar/observation/obs-radar.ukmo.uk.sh.s3.mg%2F1km%2Fintensity?timestampFrom=2016-09-08T11%3A58%3A13Z&timestampTo=2016-09-08T12%3A58%3A13Z"
+func observationsHandler(w http.ResponseWriter, r *http.Request) {
 	table := "interactivemap-radardata-processing-prod-tileset-v2"
 	from := r.FormValue("timestampFrom")
 	to := r.FormValue("timestampTo")
 	bucket := r.URL.Path[19:]
 
 	// TODO: validate input
-	//       set header
 	//       response code if error ...
 
 	//bucket := "fcst-radar.mg.uk.sh.s3.mg/1km/precipitationtype"
 	//from := "2016-09-01T11:25:00Z"
 	//to := "2016-09-08T11:25:00Z"
-
 	obs, err := obsdata(svc, table, bucket, from, to)
 	if err != nil {
 		// TODO: set response error code
 		fmt.Fprintf(w, "error: %s", err)
 	}
 
-	//TODO: json encode into final object
-	fmt.Fprintf(w, "Table: %s  From: %s To: %s", bucket, from, to)
+	//fmt.Fprintf(w, "Table: %s  From: %s To: %s", bucket, from, to)
 
-	fmt.Fprintf(w, "%#v", obs)
+	/// construct response json
+	var out ObservationOut
 
+	out.BoundingBox = obs[0].BoundingBox
+	out.MinZoomLevel = obs[0].Tileset.MinZoom
+	out.MaxZoomLevel = obs[0].Tileset.MaxZoom
+
+	for i := 0; i < len(obs); i++ {
+		timestamp := obs[i].IngestedAt // seems to be based on tilesurl
+
+		data := struct {
+			TileURL   string `json:"tileUrl"`
+			TimeStamp string `json:"_timestamp"`
+		}{obs[i].Tileset.TilesURITemplate, timestamp}
+
+		out.TimeSeries = append(out.TimeSeries, data)
+	}
+
+	o, err := json.Marshal(out)
+	if err != nil {
+		fmt.Println("OOps error: ", err)
+	}
+
+	outstring := string(o)
+
+	//w.Header().Set("Content-Type", "application/vnd.mg.timeseries+json;charset=UTF-8"  //WTF ???
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Add("Content-Length", strconv.Itoa(len(outstring)))
+
+	fmt.Fprintf(w, "%s", outstring)
 }
 
 var svc = dynamodb.New(session.New(&aws.Config{Region: aws.String("eu-west-1")}))
 
 func main() {
 
-	http.HandleFunc("/radar/observation/", observations)
+	http.HandleFunc("/radar/observation/", auth(observationsHandler))
 	http.ListenAndServe(":8080", nil)
+}
 
-	//fmt.Printf("%v\n", obs)
-
-	//fmt.Printf("%#v", resp.Items[0]["boundingBox"])
-
+// ObservationOut is constructor for output
+type ObservationOut struct {
+	BoundingBox struct {
+		Northeast struct {
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"northeast"`
+		Southwest struct {
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"southwest"`
+	} `json:"boundingbox"`
+	MinZoomLevel int64 `json:"minZoomLevel"`
+	MaxZoomLevel int64 `json:"maxZoomLevel"`
+	TimeSeries   []struct {
+		TileURL   string `json:"tileUrl"`
+		TimeStamp string `json:"_timestamp"`
+	}
 }
 
 // ObservationPath is response struct for /radar/observation
@@ -113,12 +181,12 @@ type ObservationPath struct {
 	}
 	BoundingBox struct {
 		Northeast struct {
-			Latitude  float64
-			Longitude float64
-		}
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"northeast"`
 		Southwest struct {
-			Latitude  float64
-			Longitude float64
-		}
-	}
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+		} `json:"southwest"`
+	} `json:"boundingbox"`
 }
