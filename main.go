@@ -3,9 +3,10 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -32,8 +33,8 @@ func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]Observat
 				S: aws.String(to),
 			},
 		},
-		//FilterExpression: aws.String("age >= :v_age"),
 
+		//FilterExpression: aws.String("age >= :v_age"),
 		KeyConditionExpression: aws.String("datasetId = :v_ID AND validAt BETWEEN :v_Valid1 AND :v_Valid2"),
 		Select:                 aws.String("ALL_ATTRIBUTES"),
 		ScanIndexForward:       aws.Bool(true),
@@ -41,19 +42,18 @@ func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]Observat
 
 	//Get the response
 	resp, err := svc.Query(params)
-
 	if err != nil {
-		log.Println("Query Error: ", err.Error())
+		return ret, fmt.Errorf("Query Error: %s", err)
 	}
-	//log.Println(awsutil.StringValue(resp))
 
+	//fmt.Println(awsutil.StringValue(resp))
 	for i := 0; i < len(resp.Items); i++ {
-		var bla ObservationPath
-		err = dynamodbattribute.UnmarshalMap(resp.Items[i], &bla)
+		var o ObservationPath
+		err = dynamodbattribute.UnmarshalMap(resp.Items[i], &o)
 		if err != nil {
 			return ret, fmt.Errorf("Oops: %s", err)
 		}
-		ret = append(ret, bla)
+		ret = append(ret, o)
 	}
 	return ret, nil
 }
@@ -70,8 +70,8 @@ func auth(fn http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// some hardcoded users
 func check(user, pass string) bool {
-	//fmt.Println("in check fn: ", user, " ", pass)
 	users := map[string]string{
 		"user":  "pass",
 		"user2": "pass2",
@@ -85,36 +85,33 @@ func check(user, pass string) bool {
 	return false
 }
 
-// example: curl  -u user:pass "localhost:8080/radar/observation/obs-radar.ukmo.uk.sh.s3.mg%2F1km%2Fintensity?timestampFrom=2016-09-08T11%3A58%3A13Z&timestampTo=2016-09-08T12%3A58%3A13Z"
-func observationsHandler(w http.ResponseWriter, r *http.Request) {
-	table := "interactivemap-radardata-processing-prod-tileset-v2"
-	from := r.FormValue("timestampFrom")
-	to := r.FormValue("timestampTo")
-	bucket := r.URL.Path[19:]
-
-	// TODO: validate input
-	//       response code if error ...
-
-	//bucket := "fcst-radar.mg.uk.sh.s3.mg/1km/precipitationtype"
-	//from := "2016-09-01T11:25:00Z"
-	//to := "2016-09-08T11:25:00Z"
-	obs, err := obsdata(svc, table, bucket, from, to)
-	if err != nil {
-		// TODO: set response error code
-		fmt.Fprintf(w, "error: %s", err)
+// extractTimestamp get time out of s3 url
+func extractTimestamp(s string) string {
+	st := strings.Split(s, "/")
+	if len(st) < 8 {
+		return ""
 	}
+	t, err := time.Parse("20060102T150405Z", st[len(st)-7])
+	if err != nil {
+		return "timeerr"
+	}
+	return t.Format("2006-01-02T15:04:05Z")
+}
 
-	//fmt.Fprintf(w, "Table: %s  From: %s To: %s", bucket, from, to)
-
-	/// construct response json
+// observationsOutput constructs response json
+func observationsOutput(obs []ObservationPath) (string, error) {
 	var out ObservationOut
+
+	if len(obs) == 0 {
+		return "{}", nil
+	}
 
 	out.BoundingBox = obs[0].BoundingBox
 	out.MinZoomLevel = obs[0].Tileset.MinZoom
 	out.MaxZoomLevel = obs[0].Tileset.MaxZoom
 
 	for i := 0; i < len(obs); i++ {
-		timestamp := obs[i].IngestedAt // seems to be based on tilesurl
+		timestamp := extractTimestamp(obs[i].Tileset.TilesURITemplate) // seems to be based on tilesurl
 
 		data := struct {
 			TileURL   string `json:"tileUrl"`
@@ -129,7 +126,39 @@ func observationsHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Println("OOps error: ", err)
 	}
 
-	outstring := string(o)
+	return string(o), nil
+}
+
+// example: curl  -u user:pass "localhost:8080/radar/observation/obs-radar.ukmo.uk.sh.s3.mg%2F1km%2Fintensity?timestampFrom=2016-09-08T11%3A58%3A13Z&timestampTo=2016-09-08T12%3A58%3A13Z"
+func observationsHandler(w http.ResponseWriter, r *http.Request) {
+	table := "interactivemap-radardata-processing-prod-tileset-v2"
+	from := r.FormValue("timestampFrom")
+	to := r.FormValue("timestampTo")
+	bucket := r.URL.Path[19:]
+
+	//validate input
+	if bucket == "" || from == "" || to == "" {
+		http.Error(w, "BadRequest", 400)
+		return
+	}
+
+	//bucket := "fcst-radar.mg.uk.sh.s3.mg/1km/precipitationtype"
+	//from := "2016-09-01T11:25:00Z"
+	//to := "2016-09-08T11:25:00Z"
+	obs, err := obsdata(svc, table, bucket, from, to)
+	if err != nil {
+		fmt.Fprintf(w, "error: %s", err)
+		http.Error(w, "Error getting obsdata", 500)
+		return
+	}
+
+	//fmt.Fprintf(w, "Table: %s  From: %s To: %s", bucket, from, to)
+	outstring, err := observationsOutput(obs)
+	if err != nil {
+		fmt.Fprintf(w, "error: %s", err)
+		http.Error(w, "Error creating observation output", 500)
+		return
+	}
 
 	//w.Header().Set("Content-Type", "application/vnd.mg.timeseries+json;charset=UTF-8"  //WTF ???
 	w.Header().Set("Content-Type", "application/json")
