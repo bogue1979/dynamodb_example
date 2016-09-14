@@ -8,22 +8,35 @@ import (
 	"strings"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
 )
 
+func init() {
+	// Log as JSON instead of the default ASCII formatter.
+	log.SetFormatter(&log.JSONFormatter{})
+
+	// Output to stderr instead of stdout, could also be a file.
+	//log.SetOutput(os.Stderr)
+
+	// Only log the warning severity or above.
+	log.SetLevel(log.InfoLevel)
+
+}
+
 func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]ObservationPath, error) {
 
 	var ret []ObservationPath
 
 	params := &dynamodb.QueryInput{
-		TableName: aws.String(table), // Required
+		TableName: aws.String(table),
 		Limit:     aws.Int64(1000),
 		IndexName: aws.String("datasetId-validAt-index"),
 		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
-			":v_ID": { // Required
+			":v_ID": {
 				S: aws.String(bucket),
 			},
 			":v_Valid1": {
@@ -56,6 +69,19 @@ func obsdata(svc *dynamodb.DynamoDB, table, bucket, from, to string) ([]Observat
 		ret = append(ret, o)
 	}
 	return ret, nil
+}
+
+// log wrapper
+func logrequest(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func(begin time.Time) {
+			log.WithFields(log.Fields{
+				"request_time_nanoseconds": time.Since(begin),
+			}).Info("text")
+		}(time.Now())
+
+		fn(w, r)
+	}
 }
 
 // auth wrapper based on check function
@@ -111,7 +137,8 @@ func observationsOutput(obs []ObservationPath) (string, error) {
 	out.MaxZoomLevel = obs[0].Tileset.MaxZoom
 
 	for i := 0; i < len(obs); i++ {
-		timestamp := extractTimestamp(obs[i].Tileset.TilesURITemplate) // seems to be based on tilesurl
+		// seems to be based on tilesurl
+		timestamp := extractTimestamp(obs[i].Tileset.TilesURITemplate)
 
 		data := struct {
 			TileURL   string `json:"tileUrl"`
@@ -171,7 +198,7 @@ var svc = dynamodb.New(session.New(&aws.Config{Region: aws.String("eu-west-1")})
 
 func main() {
 
-	http.HandleFunc("/radar/observation/", auth(observationsHandler))
+	http.HandleFunc("/radar/observation/", logrequest(auth(observationsHandler)))
 	http.ListenAndServe(":8080", nil)
 }
 
